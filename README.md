@@ -23,7 +23,9 @@ python3 -B demo.py
 ## 交班与恢复
 
 - `redeliver_receipt(station_db, receipt_id, port)` 将原回执和固定候选交给本地 `port(receipt, snapshot)`。隔离端口调用 `deliver_receipt(publication_db, receipt, snapshot)`。候选已接收时可以省略来件。结果带原回执号及 `waiting`、`not_selected`、`retired` 或 `issued` 状态。收到结果后检测站确认投递，未获结果可以用 `send_pending_receipts` 或按原号重投。先送达的新版证据可以待换版后重投。端口面向同一模拟站的可信本地调用，隔离站重算携带的核验口径与固定证据的一致性。
+- 证据按候选身份绑定：`load_passing_evidence` 只读取该候选名下、且回执的 `candidate_id` 与 `input_digest` 都与固定快照一致的记录。换算值相等的另一个版次（同站日、同值）不会互相满足零点或量程。当日只有首次投递的候选会被自动选为当前件；未经换版的新候选证据只得到 `not_selected`，不会被采纳为当前件。
 - `replace_candidate(station_db, station, day, candidate_id, request_id, port)` 发起具名换版。端口调用形式为 `port(request, snapshot)`，由 `admit_replacement` 接收。结果中的前一候选号是本次换版前实际选中的候选，从未选过时为 `None`。换版生效后才返回成功。未获结果可按原请求重投，重投返回该请求的首次结果。已终止的候选不能再次选中。换版后原定稿继续可领，旧候选若已先完成首签仍可按原号领取。
+- 换版在隔离写事务内生效：接收请求的一刻即终止前一候选（除非已首签，其历史仍按原号读取），并切换当前选中候选；尚未生效前端口异常直接向调用者抛出，请求保持待投递，可按原请求号重投，绝不因本地残留记录返回成功。同一 `request_id` 的重复或迟到回包重放首次结果，不改动后来已选中的较新候选。换版与首签在同一个 `BEGIN IMMEDIATE` 事务上串行，二者重叠时只有一个先后顺序：换版先提交则旧版迟到回执返回 `retired` 且不再首签；首签先提交则换版的前一候选为旧版，已签日表继续按原号可领。
 - 同一候选的两类通过回执齐备后，隔离站原子保存日表、回执及当前指针。提交前异常回滚，提交后丢回包可按原身份重试。端口的 `before_decision` 在申请隔离写事务前运行，`deliver_receipt` 的 `before_commit` 在首次签发的写入之后、提交之前运行。两个钩子供本地中断测试使用。
 - `read_report(publication_db, station=..., day=...)` 读当前件，或传 `issue_id=...` 读固定历史。查无成果返回 `None`。`export_report(publication_db, issue_id)` 返回可序列化交班件，`verify_package(package)` 核对固定编码摘要、签发号和换算出处。领件只需要隔离账册。导出摘要用于内容一致性校验，使用者从可信交班渠道取得签发件。
 
@@ -34,3 +36,18 @@ python3 -B demo.py
 运行 `python3 -B incident.py` 核对两个等值候选及迟到核验。样例已签发 R0。R1 零点在检测站核验完毕，R2 换版成功后先交付 R1 的量程通过回执，再交付 R2 的零点通过回执。直到 R2 自身量程回执到达前，站日仍应只交付 R0。R2 首签必须引用 R2-zero 与 R2-span，重开后重投与断源读取保持同一份日表和回执。
 
 另用原端口钩子暂停 R1 首签，让 R2 先完成换版。恢复后仍只应领到 R0。换版请求送达前若报端口异常，应可用原请求号重投，不能仅凭异常前的本地记录返回成功。原回归也覆盖首签先提交的顺序，以及成功回包丢失后重投旧请求时不得替换已选的较新候选。
+
+### 根因与实测
+
+根因有两个，均在隔离发布站，不涉及换算与格式：
+
+1. 取证范围过宽。`load_passing_evidence` 原先按站日聚合证据，只比较 `(station, day)`，于是 R1 的通过回执能补足 R2 的零/量程集合。等值候选因此共享核验，R2 会引用 `R1-span` 首签。
+2. 换版未终止旧候选。`admit_replacement` 只把新候选排入 `queued_candidates`，直到其首个回执到达才切换当前件，期间旧候选仍在 `active_candidates` 可首签；`replace_candidate` 在端口异常时还伪造成功结果。
+
+修复：证据只认 `candidate_id` 与 `input_digest` 都匹配固定快照的记录；换版在写事务内立即终止前一候选并切换选中件，同一 `request_id` 幂等重放首次结果，端口异常向调用者抛出且请求保持待投递，可按原号重投。
+
+实测（`python3 -B check_project.py`、`python3 -B incident.py`、`python3 -B demo.py`）：
+
+- 事故三种顺序全部 `EXIT 0`；`mixed_checks` 与 `after_old_late_check` 均为 `current=issue:R0`、`issues=1`，`after_both_new_checks` 为 `current=issue:R2` 且 `R1=None`、`issues=2`，`replacement_predecessor` 为 `R1`，重投异常前的换版仍得 `previous=R1` 且不产生成功回执。
+- 演示在 R1 迟到量程返回 `retired`、R2 零点返回 `waiting`、当前件仍 `issue:R0`；R2 量程到达后 `issue:R2` 首签引用 `R2-zero`/`R2-span`，导出校验为 `True`，首值仍为 `7/4`、`1/4`、缺测。
+- 全套回归 `total=28 failures=0`（新增 4 条：迟到旧版不补新版、提前到达的新版证据待换版、旧请求重投不覆盖较新选择、换版送达前异常可重投）。断源演示中关闭检测站后仍按 `issue:R1` 读取当前件并导出校验通过。

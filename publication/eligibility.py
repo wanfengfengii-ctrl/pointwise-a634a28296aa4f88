@@ -38,31 +38,42 @@ def admit_initial_candidate(db, snapshot):
     )
 
 
-def queue_replacement(db, snapshot):
-    if is_retired(db, snapshot.candidate_id):
-        raise ValueError('cannot select a retired candidate')
+def retire_candidate(db, candidate_id):
     db.execute(
-        'INSERT INTO queued_candidates VALUES (?, ?, ?) '
-        'ON CONFLICT(station, day) DO UPDATE SET candidate_id = excluded.candidate_id',
-        (snapshot.station, snapshot.day, snapshot.candidate_id),
+        'INSERT INTO retired_candidates VALUES (?) ON CONFLICT(candidate_id) DO NOTHING',
+        (candidate_id,),
     )
 
 
+def select_candidate(db, snapshot):
+    """Make an accepted replacement the selected candidate for the station day.
+
+    The previously selected candidate is retired, so it can never sign for the
+    first time after the replacement takes effect. A report that was already
+    first-signed stays stored in the ledger and remains readable by its issue
+    number; only new first issues are barred.
+    """
+    if is_retired(db, snapshot.candidate_id):
+        raise ValueError('cannot select a retired candidate')
+    previous = find_active_candidate(db, snapshot.station, snapshot.day)
+    if previous is not None and previous != snapshot.candidate_id:
+        retire_candidate(db, previous)
+    db.execute(
+        'INSERT INTO active_candidates VALUES (?, ?, ?) '
+        'ON CONFLICT(station, day) DO UPDATE SET candidate_id = excluded.candidate_id',
+        (snapshot.station, snapshot.day, snapshot.candidate_id),
+    )
+    db.execute('DELETE FROM queued_candidates WHERE station = ? AND day = ?', (snapshot.station, snapshot.day))
+    return previous
+
+
 def select_on_delivery(db, snapshot):
-    queued = db.execute(
-        'SELECT candidate_id FROM queued_candidates WHERE station = ? AND day = ?',
-        (snapshot.station, snapshot.day),
-    ).fetchone()
-    if queued is None:
+    """Admit the first delivered candidate; never override an existing selection."""
+    if find_active_candidate(db, snapshot.station, snapshot.day) is None:
         admit_initial_candidate(db, snapshot)
-    elif queued['candidate_id'] == snapshot.candidate_id:
-        db.execute(
-            'INSERT INTO active_candidates VALUES (?, ?, ?) '
-            'ON CONFLICT(station, day) DO UPDATE SET candidate_id = excluded.candidate_id',
-            (snapshot.station, snapshot.day, snapshot.candidate_id),
-        )
-        db.execute('DELETE FROM queued_candidates WHERE station = ? AND day = ?', (snapshot.station, snapshot.day))
 
 
 def can_issue(db, snapshot):
+    if is_retired(db, snapshot.candidate_id):
+        return False
     return find_active_candidate(db, snapshot.station, snapshot.day) == snapshot.candidate_id

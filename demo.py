@@ -87,7 +87,9 @@ def run_demo():
             expected = ['issue:R2', 'issue:R0', True]
             expected_values = ['7/4', '1/4', None]
             actual_values = [None if row.value is None else str(row.value) for row in current.report.rows[:3]]
-            if actual != expected or actual_values != expected_values:
+            # The source station above is already closed; these reads use only the ledger.
+            offline = [current.receipt.issue_id, history.receipt.issue_id, verify_package(package)]
+            if actual != expected or actual_values != expected_values or offline != expected:
                 raise RuntimeError('unexpected handover values or provenance')
             evidence = {
                 'case_id': 'late_receipts',
@@ -96,6 +98,8 @@ def run_demo():
                 'actual': [retired.status, incomplete.status, interim.receipt.issue_id],
                 'downstream_expected': {'issues_and_package': expected, 'first_values': expected_values},
                 'downstream_actual': {'issues_and_package': actual, 'first_values': actual_values},
+                'offline_expected': ['issue:R2', 'issue:R0', True],
+                'offline_actual': {'source_closed': True, 'result': offline},
                 'code_paths': ['candidate/replace.py', 'publication/admission.py', 'publication/issue.py', 'receipt/lookup.py', 'receipt/verify.py'],
                 'oracle': 'R2 only becomes current after both R2 checks. Manually applying 1/2 × raw + 1/4 to 3 and 0 gives 7/4 and 1/4. Missing stays missing.',
             }

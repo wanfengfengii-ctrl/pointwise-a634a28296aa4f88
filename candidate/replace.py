@@ -13,16 +13,9 @@ def replace_candidate(db, station, day, candidate_id, request_id, port):
     saved = record_pending_request(db, request)
     if saved is not None:
         return saved
-    try:
-        result = port(request, snapshot)
-    except ConnectionError:
-        # Retain the operator's selection when the relay is unavailable.
-        previous = db.execute(
-            'SELECT candidate_id FROM replacement_requests '
-            'WHERE station = ? AND day = ? AND confirmed = 1 ORDER BY rowid DESC LIMIT 1',
-            (station, day),
-        ).fetchone()
-        result = ReplacementResult(request, None if previous is None else previous['candidate_id'])
+    # A relay failure must not be reported as a successful replacement: leave the
+    # request pending so the operator can redeliver the same request_id.
+    result = port(request, snapshot)
     if not isinstance(result, ReplacementResult) or result.request != request:
         raise ValueError('replacement port returned a result for different inputs')
     return record_replacement_result(db, result)

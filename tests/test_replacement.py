@@ -4,10 +4,13 @@ from functools import partial
 from threading import Event
 
 from candidate.replace import replace_candidate
+from candidate.requests import load_replacement_request
 from candidate.snapshot import snapshot_digest
+from candidate.store import load_candidate
 from demo import DAY, STATION
 from inspection.delivery import redeliver_receipt
 from publication.admission import admit_replacement, deliver_receipt
+from publication.eligibility import find_active_candidate
 from publication.ledger import open_publication
 from source.database import open_station
 from tests.fixtures import StationCase
@@ -150,3 +153,71 @@ class ReplacementTests(StationCase):
         self.assertEqual(self.issue_count(), 2)
         self.assertEqual(self.sign('R2').receipt.issue_id, 'issue:R2')
         self.assertEqual(self.history('R1'), old)
+
+    def test_late_old_span_does_not_satisfy_new_candidate(self):
+        # R1 and R2 convert to the same values but are distinct fixed inputs.
+        # A late R1 span pass must never complete R2's evidence set.
+        prior, _ = self._old_in_inspection()
+        self.prepare('R2', calibration='C2', corrects='day-R1')
+        self.select('R2')
+        self.inspect('R2', 'zero')
+        self.inspect('R2', 'span')
+        self.assertEqual(self.send('R1', 'span').status, 'retired', MARKER)
+        self.assertEqual(self.send('R2', 'zero').status, 'waiting', MARKER)
+        self._assert_prior_only(prior)
+        updated = self.send('R2', 'span').issue
+        self.assertEqual(updated.receipt.zero_receipt_id, 'R2-zero')
+        self.assertEqual(updated.receipt.span_receipt_id, 'R2-span')
+        self.assertEqual(self.current().receipt.issue_id, 'issue:R2')
+
+    def test_early_new_evidence_waits_for_replacement(self):
+        prior = self.sign(self.prepare('R0').candidate_id)
+        self.prepare('R1', corrects='day-R0')
+        new = self.prepare('R2', calibration='C3', corrects='day-R1')
+        self.select('R1')
+        self.inspect('R2', 'zero')
+        self.inspect('R2', 'span')
+        self.assertEqual(self.send('R2', 'zero').status, 'not_selected')
+        self.assertEqual(self.send('R2', 'span').status, 'not_selected')
+        self.assertEqual(self.current(), prior)
+        self.assertEqual(self.issue_count(), 1)
+        self.assertEqual(self.select('R2').previous_candidate_id, 'R1')
+        self.assertEqual(self.send('R2', 'zero').status, 'issued')
+        self.assertEqual(self.send('R2', 'span').status, 'issued')
+        self.assertEqual(self.current().report, new)
+        self.assertEqual(self.issue_count(), 2)
+
+    def test_redelivered_old_request_keeps_newer_selection(self):
+        prior = self.sign(self.prepare('R0').candidate_id)
+        self.prepare('R1', corrects='day-R0')
+        self.prepare('R2', calibration='C3', corrects='day-R1')
+        self.select('R1')
+        self.select('R2')
+        first = load_replacement_request(self.station, 'select-R1')[1]
+        self.assertEqual(first.previous_candidate_id, 'R0')
+        # Replaying the older request must not flip the active selection back to R1.
+        self.assertEqual(self.select('R1'), first)
+        self.assertEqual(find_active_candidate(self.publication, STATION, DAY), 'R2')
+        self.inspect('R1', 'zero')
+        self.inspect('R1', 'span')
+        self.assertEqual(self.send('R1', 'span').status, 'retired', MARKER)
+        self.assertIsNone(self.history('R1'))
+        self.assertEqual(self.current(), prior)
+        self.assertEqual(self.sign('R2').receipt.issue_id, 'issue:R2')
+
+    def test_replacement_failure_before_delivery_is_retryable(self):
+        self.sign(self.prepare('R0').candidate_id)
+        self.prepare('R1', corrects='day-R0')
+        self.prepare('R2', calibration='C3', corrects='day-R1')
+        self.select('R1')
+
+        def fail_before_delivery(request, snapshot):
+            raise ConnectionError('simulated relay failure before delivery')
+
+        with self.assertRaises(ConnectionError):
+            self.select('R2', port=fail_before_delivery)
+        self.assertIsNone(load_replacement_request(self.station, 'select-R2')[1])
+        self.reopen()
+        retried = self.select('R2')
+        self.assertEqual(retried.previous_candidate_id, 'R1')
+        self.assertEqual(load_candidate(self.station, 'R2').candidate_id, 'R2')

@@ -1,10 +1,10 @@
 from dataclasses import dataclass
 
 from candidate.requests import ReplacementRequest, ReplacementResult
-from candidate.snapshot import snapshot_digest
+from candidate.snapshot import canonical_json, snapshot_digest
 from inspection.receipts import CheckReceipt
-from publication.eligibility import (can_issue, find_active_candidate, initialize_eligibility,
-                                     is_retired, queue_replacement, select_on_delivery)
+from publication.eligibility import (can_issue, initialize_eligibility, is_retired,
+                                     select_candidate, select_on_delivery)
 from publication.evidence import initialize_evidence, load_received_candidate, pin_candidate, record_evidence
 from publication.issue import issue_if_eligible
 from publication.ledger import IssueRecord, initialize_ledger, write_transaction
@@ -31,6 +31,25 @@ def initialize_publication(db):
     ''')
 
 
+def _request_body(request):
+    return canonical_json({
+        'request_id': request.request_id, 'station': request.station, 'day': request.day,
+        'candidate_id': request.candidate_id, 'input_digest': request.input_digest,
+    })
+
+
+def _admitted_replacement(db, request):
+    row = db.execute(
+        'SELECT request_body, previous_candidate_id FROM admitted_replacements WHERE request_id = ?',
+        (request.request_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    if row['request_body'] != _request_body(request):
+        raise ValueError(f'conflicting replacement request {request.request_id}')
+    return ReplacementResult(request, row['previous_candidate_id'])
+
+
 def admit_replacement(db, request, snapshot, *, before_decision=None):
     if not isinstance(request, ReplacementRequest):
         raise ValueError('expected a named replacement request')
@@ -41,11 +60,31 @@ def admit_replacement(db, request, snapshot, *, before_decision=None):
         raise ValueError('replacement request differs from the fixed candidate')
     if before_decision is not None:
         before_decision()
+    body = _request_body(request)
     with write_transaction(db):
         fixed = pin_candidate(db, snapshot)
-        previous = find_active_candidate(db, fixed.station, fixed.day)
-        queue_replacement(db, fixed)
+        original = _admitted_replacement(db, request)
+        if original is not None:
+            # Redelivery of an already effective request replays its first result and
+            # never re-selects a candidate chosen by a later request.
+            return original
+        previous = select_candidate(db, fixed)
+        db.execute(
+            'INSERT INTO admitted_replacements VALUES (?, ?, ?)',
+            (request.request_id, body, previous),
+        )
         return ReplacementResult(request, previous)
+
+
+def _after_delivery(db, fixed):
+    issue, created = issue_if_eligible(db, fixed)
+    if issue is not None:
+        return 'issued', issue, created
+    if is_retired(db, fixed.candidate_id):
+        return 'retired', None, False
+    if can_issue(db, fixed):
+        return 'waiting', None, False
+    return 'not_selected', None, False
 
 
 def deliver_receipt(db, receipt, snapshot=None, *, before_decision=None, before_commit=None):
@@ -58,12 +97,7 @@ def deliver_receipt(db, receipt, snapshot=None, *, before_decision=None, before_
                  else pin_candidate(db, snapshot))
         record_evidence(db, fixed, receipt)
         select_on_delivery(db, fixed)
-        issue, created = issue_if_eligible(db, fixed)
-        if issue is not None:
-            if created and before_commit is not None:
-                before_commit()
-            return DeliveryResult(receipt.receipt_id, 'issued', issue)
-        if is_retired(db, fixed.candidate_id):
-            return DeliveryResult(receipt.receipt_id, 'retired')
-        status = 'waiting' if can_issue(db, fixed) else 'not_selected'
-        return DeliveryResult(receipt.receipt_id, status)
+        status, issue, created = _after_delivery(db, fixed)
+        if issue is not None and created and before_commit is not None:
+            before_commit()
+        return DeliveryResult(receipt.receipt_id, status, issue)

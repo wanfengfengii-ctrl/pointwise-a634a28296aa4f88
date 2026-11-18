@@ -1,5 +1,3 @@
-import json
-
 from candidate.snapshot import decode_snapshot, encode_snapshot, snapshot_digest
 from inspection.receipts import CheckReceipt, decode_check_receipt, encode_check_receipt, evaluate_check
 
@@ -64,14 +62,18 @@ def record_evidence(db, snapshot, receipt):
 
 def load_passing_evidence(db, candidate_id):
     fixed = load_received_candidate(db, candidate_id)
+    expected_digest = snapshot_digest(fixed)
     checks = {}
+    # Evidence is bound to one frozen candidate input. Equal conversion values in a
+    # different revision/candidate must never satisfy this candidate's checks.
     for row in db.execute(
-        'SELECT e.kind, e.body, c.snapshot FROM received_evidence AS e '
-        'JOIN received_candidates AS c USING(candidate_id) '
-        'LEFT JOIN issues AS i ON i.candidate_id = e.candidate_id '
-        'WHERE i.issue_id IS NULL ORDER BY e.candidate_id = ?, e.rowid', (candidate_id,)
+        'SELECT kind, body FROM received_evidence WHERE candidate_id = ? ORDER BY rowid',
+        (candidate_id,),
     ):
-        owner = json.loads(row['snapshot'])
-        if (owner['station'], owner['day']) == (fixed.station, fixed.day):
-            checks[row['kind']] = decode_check_receipt(row['body'])
+        receipt = decode_check_receipt(row['body'])
+        if (receipt.candidate_id, receipt.input_digest, receipt.kind) != (
+            candidate_id, expected_digest, row['kind']
+        ):
+            raise ValueError(f'stored evidence does not belong to candidate {candidate_id}')
+        checks[row['kind']] = receipt
     return {kind: receipt for kind, receipt in checks.items() if receipt.passed}
